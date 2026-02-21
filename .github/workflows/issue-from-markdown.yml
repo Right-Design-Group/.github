@@ -3,11 +3,6 @@ name: Create GitHub Issues from Markdown Specs
 on:
   workflow_call:
 
-permissions:
-  issues: write
-  contents: write
-  actions: write
-
 jobs:
   create-issues-from-markdown:
     runs-on: ubuntu-latest
