@@ -10,26 +10,26 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
 
-      - name: Detect changed issue files
-        id: changed-files
+      - name: Find all unlinked issue specs
+        id: find-specs
         run: |
-          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- '.github/issues/*.md' | grep -v 'README.md' | grep -v 'archive/' || true)
+          # Scan ALL .github/issues/*.md files (not just changed ones)
+          # The <!-- GitHub Issue: #N --> marker provides idempotency
+          ALL_FILES=$(find .github/issues -maxdepth 1 -name '*.md' ! -name 'README.md' 2>/dev/null | sort || true)
 
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "No issue files changed"
+          if [ -z "$ALL_FILES" ]; then
+            echo "No issue spec files found"
             echo "files=" >> $GITHUB_OUTPUT
           else
-            echo "Changed issue files:"
-            echo "$CHANGED_FILES"
-            FILES_JSON=$(echo "$CHANGED_FILES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "Found issue spec files:"
+            echo "$ALL_FILES"
+            FILES_JSON=$(echo "$ALL_FILES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
             echo "files=$FILES_JSON" >> $GITHUB_OUTPUT
           fi
 
       - name: Process issue files
-        if: steps.changed-files.outputs.files != '' && steps.changed-files.outputs.files != '[]'
+        if: steps.find-specs.outputs.files != '' && steps.find-specs.outputs.files != '[]'
         uses: actions/github-script@v7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -38,31 +38,33 @@ jobs:
           script: |
             const fs = require('fs');
 
-            const changedFiles = ${{ steps.changed-files.outputs.files }};
+            const allFiles = ${{ steps.find-specs.outputs.files }};
 
-            if (!changedFiles || changedFiles.length === 0) {
+            if (!allFiles || allFiles.length === 0) {
               console.log('No files to process');
               return;
             }
 
-            console.log(`Processing ${changedFiles.length} issue file(s)`);
+            console.log(`Scanning ${allFiles.length} issue spec file(s)`);
+            let created = 0;
+            let skipped = 0;
 
-            for (const filePath of changedFiles) {
+            for (const filePath of allFiles) {
               try {
-                console.log(`\n📄 Processing: ${filePath}`);
-
                 const content = fs.readFileSync(filePath, 'utf8');
 
                 // Skip if already linked to an issue
                 const issueNumberMatch = content.match(/<!-- GitHub Issue: #(\d+) -->/);
                 if (issueNumberMatch) {
-                  console.log(`⏭️  Already linked to issue #${issueNumberMatch[1]}, skipping`);
+                  console.log(`⏭️  ${filePath} → already #${issueNumberMatch[1]}`);
+                  skipped++;
                   continue;
                 }
 
                 // Skip if marked completed-without-issue
                 if (content.includes('<!-- Completed without GitHub Issue')) {
-                  console.log(`⏭️  Marked as completed-without-issue, skipping`);
+                  console.log(`⏭️  ${filePath} → completed without issue`);
+                  skipped++;
                   continue;
                 }
 
@@ -71,11 +73,14 @@ jobs:
                 const status = statusMatch ? statusMatch[1].toLowerCase() : '';
                 const completedStatuses = ['complete', 'completed', 'done', 'closed', 'resolved'];
                 if (completedStatuses.includes(status)) {
-                  console.log(`✅ Status "${statusMatch[1]}" — already complete, skipping`);
+                  console.log(`✅ ${filePath} → status "${statusMatch[1]}", marking as complete`);
                   const skipMarker = `<!-- Completed without GitHub Issue — status was "${statusMatch[1]}" at merge time -->\n\n`;
                   fs.writeFileSync(filePath, skipMarker + content, 'utf8');
+                  skipped++;
                   continue;
                 }
+
+                console.log(`\n📄 Processing: ${filePath}`);
 
                 // Extract title from first H1, strip leading number prefix (e.g. "044: ")
                 const titleMatch = content.match(/^#\s+(.+)$/m);
@@ -113,6 +118,7 @@ jobs:
                 });
 
                 console.log(`✅ Created issue #${issue.data.number}: ${issue.data.html_url}`);
+                created++;
 
                 // Update markdown with issue link
                 const issueLink = `<!-- GitHub Issue: #${issue.data.number} - ${issue.data.html_url} -->\n\n`;
@@ -129,7 +135,7 @@ jobs:
                   });
                   console.log(`🎭 Stakeholder review triggered`);
                 } catch (e) {
-                  console.log(`ℹ️  No stakeholder review workflow found (optional)`);
+                  console.log(`ℹ️  No stakeholder review workflow (optional)`);
                 }
 
               } catch (error) {
@@ -137,10 +143,9 @@ jobs:
               }
             }
 
-            console.log('\n✅ Issue processing complete');
+            console.log(`\n✅ Done: ${created} created, ${skipped} skipped`);
 
       - name: Commit updated markdown files
-        if: steps.changed-files.outputs.files != '' && steps.changed-files.outputs.files != '[]'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -149,7 +154,7 @@ jobs:
             echo "No changes to commit"
           else
             git add .github/issues/
-            git commit -m "docs: Add GitHub issue links to markdown files [skip ci]"
+            git commit -m "docs: Link markdown specs to GitHub issues [skip ci]"
             git push
             echo "✅ Committed and pushed updated markdown files"
           fi
