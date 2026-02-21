@@ -1,0 +1,160 @@
+name: Create GitHub Issues from Markdown Specs
+
+on:
+  workflow_call:
+
+permissions:
+  issues: write
+  contents: write
+  actions: write
+
+jobs:
+  create-issues-from-markdown:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed issue files
+        id: changed-files
+        run: |
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- '.github/issues/*.md' | grep -v 'README.md' | grep -v 'archive/' || true)
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No issue files changed"
+            echo "files=" >> $GITHUB_OUTPUT
+          else
+            echo "Changed issue files:"
+            echo "$CHANGED_FILES"
+            FILES_JSON=$(echo "$CHANGED_FILES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "files=$FILES_JSON" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Process issue files
+        if: steps.changed-files.outputs.files != '' && steps.changed-files.outputs.files != '[]'
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            const changedFiles = ${{ steps.changed-files.outputs.files }};
+
+            if (!changedFiles || changedFiles.length === 0) {
+              console.log('No files to process');
+              return;
+            }
+
+            console.log(`Processing ${changedFiles.length} issue file(s)`);
+
+            for (const filePath of changedFiles) {
+              try {
+                console.log(`\n📄 Processing: ${filePath}`);
+
+                const content = fs.readFileSync(filePath, 'utf8');
+
+                // Skip if already linked to an issue
+                const issueNumberMatch = content.match(/<!-- GitHub Issue: #(\d+) -->/);
+                if (issueNumberMatch) {
+                  console.log(`⏭️  Already linked to issue #${issueNumberMatch[1]}, skipping`);
+                  continue;
+                }
+
+                // Skip if marked completed-without-issue
+                if (content.includes('<!-- Completed without GitHub Issue')) {
+                  console.log(`⏭️  Marked as completed-without-issue, skipping`);
+                  continue;
+                }
+
+                // Skip if status is complete/done/closed
+                const statusMatch = content.match(/\*\*Status:\*\*\s*([\w-]+)/i);
+                const status = statusMatch ? statusMatch[1].toLowerCase() : '';
+                const completedStatuses = ['complete', 'completed', 'done', 'closed', 'resolved'];
+                if (completedStatuses.includes(status)) {
+                  console.log(`✅ Status "${statusMatch[1]}" — already complete, skipping`);
+                  const skipMarker = `<!-- Completed without GitHub Issue — status was "${statusMatch[1]}" at merge time -->\n\n`;
+                  fs.writeFileSync(filePath, skipMarker + content, 'utf8');
+                  continue;
+                }
+
+                // Extract title from first H1, strip leading number prefix (e.g. "044: ")
+                const titleMatch = content.match(/^#\s+(.+)$/m);
+                const rawTitle = titleMatch ? titleMatch[1].trim() : `Issue from ${filePath.split('/').pop()}`;
+                const title = rawTitle.replace(/^\d+:\s*/, '');
+
+                // Determine labels
+                const labels = [];
+                if (filePath.includes('bug-') || title.toLowerCase().includes('bug:')) {
+                  labels.push('bug');
+                } else if (filePath.includes('feature-') || title.toLowerCase().includes('feature:')) {
+                  labels.push('enhancement');
+                } else if (title.toLowerCase().includes('architecture')) {
+                  labels.push('architecture', 'enhancement');
+                } else {
+                  labels.push('enhancement');
+                }
+                if (content.toLowerCase().includes('security') || content.toLowerCase().includes('vulnerability')) {
+                  labels.push('security');
+                }
+                if (content.toLowerCase().includes('performance') || content.toLowerCase().includes('optimization')) {
+                  labels.push('performance');
+                }
+
+                const issueBody = `<!-- Auto-generated from ${filePath} -->\n\n${content}\n\n---\n\n*This issue was automatically created from [\`${filePath}\`](${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/blob/main/${filePath}).*`;
+
+                console.log(`📝 Creating issue: "${title}" [${labels.join(', ')}]`);
+
+                const issue = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: title,
+                  body: issueBody,
+                  labels: labels
+                });
+
+                console.log(`✅ Created issue #${issue.data.number}: ${issue.data.html_url}`);
+
+                // Update markdown with issue link
+                const issueLink = `<!-- GitHub Issue: #${issue.data.number} - ${issue.data.html_url} -->\n\n`;
+                fs.writeFileSync(filePath, issueLink + content, 'utf8');
+
+                // Try to trigger stakeholder review if the workflow exists
+                try {
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    workflow_id: 'issue-stakeholder-review.yml',
+                    ref: 'main',
+                    inputs: { issue_number: String(issue.data.number) }
+                  });
+                  console.log(`🎭 Stakeholder review triggered`);
+                } catch (e) {
+                  console.log(`ℹ️  No stakeholder review workflow found (optional)`);
+                }
+
+              } catch (error) {
+                console.error(`❌ Error processing ${filePath}:`, error.message);
+              }
+            }
+
+            console.log('\n✅ Issue processing complete');
+
+      - name: Commit updated markdown files
+        if: steps.changed-files.outputs.files != '' && steps.changed-files.outputs.files != '[]'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "No changes to commit"
+          else
+            git add .github/issues/
+            git commit -m "docs: Add GitHub issue links to markdown files [skip ci]"
+            git push
+            echo "✅ Committed and pushed updated markdown files"
+          fi
