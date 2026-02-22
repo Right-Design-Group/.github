@@ -87,6 +87,22 @@ jobs:
                 const rawTitle = titleMatch ? titleMatch[1].trim() : `Issue from ${filePath.split('/').pop()}`;
                 const title = rawTitle.replace(/^\d+:\s*/, '');
 
+                // Double-check: search GitHub for existing issue with same title (prevents race conditions)
+                const searchResult = await github.rest.search.issuesAndPullRequests({
+                  q: `repo:${context.repo.owner}/${context.repo.repo} is:issue in:title "${title.replace(/"/g, '\\"')}"`,
+                  per_page: 5
+                });
+                const titleMatch2 = searchResult.data.items.find(i => i.title === title);
+                if (titleMatch2) {
+                  console.log(`⏭️  ${filePath} → issue "${title}" already exists as #${titleMatch2.number} (title match)`);
+                  const issueLink = `<!-- GitHub Issue: #${titleMatch2.number} - ${titleMatch2.html_url} -->\n\n`;
+                  if (!content.includes(`#${titleMatch2.number}`)) {
+                    fs.writeFileSync(filePath, issueLink + content, 'utf8');
+                  }
+                  skipped++;
+                  continue;
+                }
+
                 // Determine labels
                 const labels = [];
                 if (filePath.includes('bug-') || title.toLowerCase().includes('bug:')) {
